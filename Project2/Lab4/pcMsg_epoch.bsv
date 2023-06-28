@@ -22,41 +22,28 @@ import Exec::*;
 import Cop::*;
 import Fifo::*;
 import AddrPred::*;
-// add for lab4
 import Scoreboard::*;
 
-// change for lab4
-// typedef struct {
-//   Addr pc;
-//   Addr ppc;
-//   Data inst;
-//   Bool epoch;
-// } Fetch2Execute deriving (Bits, Eq);
-
-// add for lab4
 typedef struct {
   Addr pc;
   Addr ppc;
   Data inst;
   Bool epoch;
-  Data d1;
-  Data d2;
-  DecodedInst decodedInst;
+  DecodedInst dInst;
+  Data rVal1;
+  Data rVal2;
 } Fetch2Execute deriving (Bits, Eq);
 
-// add for lab4
 typedef struct {
-  Addr pc;
-  Data inst;
   Maybe#(FullIndx) dst;
   Data data;
-} Execute2Writeback deriving (Bits, Eq);
+} Execute2WriteBack deriving (Bits, Eq);
 
-// add for lab4
 typedef struct {
   Maybe#(FullIndx) dst;
   Data data;
 } WritebackData deriving (Bits, Eq);
+
 
 interface Proc;
    method ActionValue#(Tuple2#(RIndx, Data)) cpuToHost;
@@ -72,31 +59,29 @@ module [Module] mkProc(Proc);
   Cop       cop <- mkCop;
   AddrPred pcPred <- mkBtb;
 
-  // change for lab4
-  Fifo#(2, Fetch2Execute) ir <- mkPipelineFifo;
-  Fifo#(2, Execute2Writeback) wreg <- mkPipelineFifo;
-  // Fifo#(2, Fetch2Execute) ir <- mkCFFifo;
+  Fifo#(2, Fetch2Execute) ireg <- mkPipelineFifo;
+  Fifo#(2, Execute2WriteBack) wreg <- mkPipelineFifo;
+  
   Fifo#(1, Redirect) execRedirect <- mkBypassFifo;
+  // add for lab4, bypassing data from writeback to fetch
   Fifo#(1, WritebackData) writebackBypass <- mkBypassFifo;
-  //Fifo#(2, Redirect)   execRedirect <- mkCFFifo;
 
-  // add for lab4
-  Scoreboard#(2) scoreBoard <- mkCFScoreboard;
-
-  //This design uses two epoch registers, one for each stage of the pipeline. Execute sets the eEpoch and discards any instruction that doesn't match it. It passes the information about change of epoch to fetch stage indirectly by passing a valid execRedirect using a Fifo. Fetch changes fEpoch everytime it gets a execRedirect and tags every instruction with its epoch
+  Scoreboard#(2) scoreboard <- mkCFScoreboard;
 
   Reg#(Bool) fEpoch <- mkReg(False);
   Reg#(Bool) eEpoch <- mkReg(False);
 
   rule doFetch(cop.started);
     let inst = iMem.req(pc);
-
     $display("Fetch: pc: %h inst: (%h) expanded: ", pc, inst, showInst(inst));
 
-    // add for lab4
-    // let dInst = decode(inst);
-    // let flag1 = scoreBoard.search2(dInst.src1);
-    // let flag2 = scoreBoard.search2(dInst.src2);
+    // add for lab4, decode here
+    let dInst = decode(inst);
+
+    // add for lab4, check scoreboard
+    let flag1 = scoreboard.search2(dInst.src1);
+    let flag2 = scoreboard.search2(dInst.src2);
+    let flagWriting = flag1 || flag2;
 
     // dequeue the incoming redirect and update the predictor whether it's a mispredict or not
     if(execRedirect.notEmpty)
@@ -104,103 +89,82 @@ module [Module] mkProc(Proc);
       execRedirect.deq;
       pcPred.update(execRedirect.first);
     end
+
+    // add for lab4, clean the bypass data
+    if(writebackBypass.notEmpty)
+    begin
+      writebackBypass.deq;
+    end
+
     // change pc and the fetch's copy of the epoch only on a mispredict
     if(execRedirect.notEmpty && execRedirect.first.mispredict)
     begin
       fEpoch <= !fEpoch;
       pc <= execRedirect.first.nextPc;
-    end
-    // fetch the new instruction on a non mispredict
+    end    
+    // add for lab4, try to fetch the new instruction on a non mispredict
     else
-    begin
-      // change for lab4, decode and read register
-      // let ppc = pcPred.predPc(pc);
-      // pc <= ppc;
-      // ir.enq(Fetch2Execute{pc: pc, ppc: ppc, inst: inst, epoch: fEpoch});
-      let decodedInst = decode(inst);
-      Bool dataConflict = False;
-      Data rVal1 = ?;
-      Data rVal2 = ?;
-      // read src1 from regs or bypass
-      if (scoreBoard.search1(decodedInst.src1))
+    begin 
+      // add for lab4, if data conflict and have bypass data, check bypass data
+      if(writebackBypass.notEmpty && flagWriting)
       begin
-        if (writebackBypass.notEmpty 
-          && isValid(writebackBypass.first.dst) 
-          && validRegValue(writebackBypass.first.dst) == validRegValue(decodedInst.src1))
+        let rVal2 = rf.rd2(validRegValue(dInst.src2));
+        let rVal1 = rf.rd1(validRegValue(dInst.src1));
+        if((!flag2) && dInst.src1==writebackBypass.first.dst)
         begin
-          rVal1 = writebackBypass.first.data;
+          // add display will stack overflow ?????????? 
+          // $display("Fetch and read reg from bypass(R1): pc: %h inst: (%h) expanded: ", pc, inst, showInst(inst));
+          let ppc = pcPred.predPc(pc);
+          pc <= ppc;
+          ireg.enq(Fetch2Execute{pc:pc , ppc:ppc , inst:inst , epoch:fEpoch , dInst:dInst , rVal1:writebackBypass.first.data , rVal2: rVal2});
+          if(isValid(dInst.dst))
+            scoreboard.insert(dInst.dst);
         end
-        else 
+        else if((!flag1) && dInst.src2==writebackBypass.first.dst)
         begin
-          dataConflict = True;
-        end
-      end
-      else 
-      begin
-        rVal1 = rf.rd1(validRegValue(decodedInst.src1));
-      end
-      // read src2 from regs or bypass
-      if (scoreBoard.search2(decodedInst.src2))
-      begin
-        if (writebackBypass.notEmpty 
-          && isValid(writebackBypass.first.dst) 
-          && validRegValue(writebackBypass.first.dst) == validRegValue(decodedInst.src2))
-        begin
-          rVal2 = writebackBypass.first.data;
-        end
-        else 
-        begin
-          dataConflict = True;
+          // $display("Fetch and read reg from bypass(R2): pc: %h inst: (%h) expanded: ", pc, inst, showInst(inst));
+          let ppc = pcPred.predPc(pc);
+          pc <= ppc;
+          ireg.enq(Fetch2Execute{pc:pc , ppc:ppc , inst:inst , epoch:fEpoch , dInst:dInst , rVal1: rVal1, rVal2: writebackBypass.first.data});
+          if(isValid(dInst.dst))
+            scoreboard.insert(dInst.dst);
         end
       end
-      else 
-      begin
-        rVal2 = rf.rd2(validRegValue(decodedInst.src2));
-      end
-      // clear writeback bypass
-      writebackBypass.deq();
-      // if read all success, fire it
-      if (!dataConflict)
+      // add for lab4, fire if there is no data conflict
+      else if(!flagWriting)
       begin
         let ppc = pcPred.predPc(pc);
+        let rVal2 = rf.rd2(validRegValue(dInst.src2));
+        let rVal1 = rf.rd1(validRegValue(dInst.src1));
+        // $display("Fetch and read reg: pc: %h inst: (%h) expanded: ", pc, inst, showInst(inst));
         pc <= ppc;
-        ir.enq(Fetch2Execute{pc:pc , ppc:ppc , inst:inst , epoch:fEpoch , d1:rVal1 , d2:rVal2 , decodedInst:decodedInst});
-        scoreBoard.insert(decodedInst.dst);
-      end
-      // if ((!flag1) && (!flag2))
-      // begin
-      //   let ppc = pcPred.predPc(pc);
-      //   pc <= ppc;
-      //   let rVal1 = rf.rd1(validRegValue(dInst.src1));
-      //   let rVal2 = rf.rd2(validRegValue(dInst.src2));
-      //   ir.enq(Fetch2Execute{pc:pc , ppc:ppc , inst:inst , epoch:fEpoch , decodedInst:dInst , d1:rVal1 , d2: rVal2});
-      //   scoreBoard.insert(dInst.dst);
-      // end
+        ireg.enq(Fetch2Execute{pc:pc , ppc:ppc , inst:inst , epoch:fEpoch , dInst:dInst , rVal1:rVal1 , rVal2: rVal2});
+        if(isValid(dInst.dst))
+          scoreboard.insert(dInst.dst);
+      end 
+      // add for lab4, do nothing if there is data conflict, write a useless line here to make bluespec happy
+      else 
+        let ppc = pcPred.predPc(pc);
     end
   endrule
 
   rule doExecute;
-    let inst  = ir.first.inst;
-    let pc    = ir.first.pc;
-    let ppc   = ir.first.ppc;
-    let epoch = ir.first.epoch;
+    let inst  = ireg.first.inst;
+    let pc    = ireg.first.pc;
+    let ppc   = ireg.first.ppc;
+    let epoch = ireg.first.epoch;
+
+    // add for lab4
+    let dInst = ireg.first.dInst;
+    let rVal1 = ireg.first.rVal1;
+    let rVal2 = ireg.first.rVal2;
 
     // Proceed only if the epochs match
     if(epoch == eEpoch)
     begin
-      $display("Execute: pc: %h inst: (%h) expanded: ", pc, inst, showInst(inst));
-  
-      // change for lab4
-      // let dInst = decode(inst);
-      // let rVal1 = rf.rd1(validRegValue(dInst.src1));
-      // let rVal2 = rf.rd2(validRegValue(dInst.src2)); 
-      let dInst = ir.first.decodedInst;
-      let rVal1 = ir.first.d1;
-      let rVal2 = ir.first.d2;    
-  
       let copVal = cop.rd(validRegValue(dInst.src1));
-  
-      let eInst = exec(dInst, rVal1, rVal2, pc, ppc, copVal);
+      let eInst = exec(dInst, rVal1, rVal2, pc, ppc, copVal);  
+      $display("Execute: pc: %h inst: (%h) expanded: ", pc, inst, showInst(inst));
   
       if(eInst.iType == Unsupported)
       begin
@@ -208,7 +172,6 @@ module [Module] mkProc(Proc);
         $finish;
       end
 
-      // memory
       if(eInst.iType == Ld)
       begin
         let data <- dMem.req(MemReq{op: Ld, addr: eInst.addr, byteEn: ?, data: ?});
@@ -220,48 +183,39 @@ module [Module] mkProc(Proc);
         let d <- dMem.req(MemReq{op: St, addr: eInst.addr, byteEn: byteEn, data: data});
       end
 
-      // change for lab4, move to writeback
-      // if (isValid(eInst.dst) && validValue(eInst.dst).regType == Normal)
-      //   rf.wr(validRegValue(eInst.dst), eInst.data);
-      wreg.enq(Execute2Writeback{pc:pc , inst:inst , dst:eInst.dst , data:eInst.data});
+      // add for lab4, add writeback stage
+      wreg.enq(Execute2WriteBack{dst:eInst.dst , data:eInst.data});
       writebackBypass.enq(WritebackData{dst:eInst.dst , data:eInst.data});
 
-  
       // Send the branch resolution to fetch stage, irrespective of whether it's mispredicted or not
        // TBD: put code here that does what the comment immediately above says
-      if (eInst.brTaken)
-        execRedirect.enq(Redirect{nextPc: eInst.addr, mispredict: eInst.mispredict, brType: eInst.iType});
+      if(eInst.brTaken)
+        execRedirect.enq(Redirect{nextPc: eInst.addr,mispredict:eInst.mispredict});
       // On a branch mispredict, change the epoch, to throw away wrong path instructions
        // TBD: put code here that does what the comment immediately above says
-      if (eInst.brTaken && eInst.mispredict)
+      if(eInst.brTaken && eInst.mispredict)
         eEpoch <= !eEpoch;
-  
+      
       cop.wr(eInst.dst, eInst.data);
     end
-    // add for lab4
     else
     begin
-      // clear scoreboard when mispredict
-      scoreBoard.remove;
+      if(isValid(dInst.dst))
+        scoreboard.remove;
     end
-
-    ir.deq;
-  endrule
-
-  // add for lab4
-  rule doWriteback;
-    if (isValid(wreg.first.dst) && validValue(wreg.first.dst).regType == Normal)
-    begin
-      rf.wr(validRegValue(wreg.first.dst), wreg.first.data);
-      let pc = wreg.first.pc;
-      let inst = wreg.first.inst;
-      $display("WriteBack: pc: %h inst: (%h) expanded: ", pc, inst, showInst(inst));
-    end
-      
-    wreg.deq();
-    scoreBoard.remove;
+    ireg.deq();
   endrule
   
+  rule doWriteBack;
+    let dst = wreg.first.dst;
+    let data = wreg.first.data;
+    if (isValid(dst) && validValue(dst).regType == Normal)
+      rf.wr(validRegValue(dst), data);
+    if (isValid(dst))
+      scoreboard.remove;
+    wreg.deq();
+  endrule
+
   method ActionValue#(Tuple2#(RIndx, Data)) cpuToHost;
     let ret <- cop.cpuToHost;
     return ret;
@@ -273,9 +227,3 @@ module [Module] mkProc(Proc);
   endmethod
 endmodule
 
-//comments
-// This code also works with either (or both) Fifo replaced with CFFifo
-// If both Fifos are CFFifo, then fetch and execute are also conflict free
-// If either Fifo is not CFFifo, then fetch and execute can be scheduled concurrently, with execute<fetch
-// If BypassFifo is used for pc-redirect, then the processor is slightly faster
-// This is by far the most robust solution as we will see later
